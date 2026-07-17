@@ -18,19 +18,21 @@ conftest dependency graph** statically, from the diff alone. It intentionally
 does *not* try to be a general-purpose "what changed" tool -- there are
 already good ones, and they solve a different problem:
 
-| | **pytest-impact** | [pytest-testmon] | [pytest-picked] | [pytest-impacted] |
-|---|---|---|---|---|
-| Unit of change tracking | fixture / conftest / hook / test **symbols** (AST) | **line-level coverage** of arbitrary source | changed/new **files** | git diff (file/coverage oriented) |
-| Understands fixture overrides | **Yes** -- resolves the winning `FixtureDef` per test | N/A (traces real execution, so overrides are implicitly correct) | No (file-level only) | No |
-| Tracks arbitrary application code | **No** (by design -- see Limitations) | **Yes** (its core strength) | No | Partial |
-| Needs a persisted DB / prior run | No | Yes (`.testmondata`) | No | No |
-| Works cold on first CI run | **Yes** | No (needs a baseline run) | Yes | Yes |
-| Detects decorator-only changes (e.g. `scope=`, `parametrize`) | **Yes** | Yes (via re-execution) | No | No |
-| Coverage instrumentation required | **No** | Yes | No | No |
+| | **pytest-impact** | [pytest-testmon] | [pytest-picked] | [pytest-impacted] | [snob] |
+|---|---|---|---|---|---|
+| Unit of change tracking | fixture / conftest / hook / test **symbols** (AST) | **line-level coverage** of arbitrary source | changed/new **files** | git diff (file/coverage oriented) | static **import graph** (transitive imports) |
+| Understands fixture overrides | **Yes** -- resolves the winning `FixtureDef` per test | N/A (traces real execution, so overrides are implicitly correct) | No (file-level only) | No | No |
+| Tracks arbitrary application code | **No** (by design -- see Limitations) | **Yes** (its core strength) | No | Partial | **Yes**, via import edges (its core strength) |
+| Needs a persisted DB / prior run | No | Yes (`.testmondata`) | No | No | No |
+| Works cold on first CI run | **Yes** | No (needs a baseline run) | Yes | Yes | Yes |
+| Detects decorator-only changes (e.g. `scope=`, `parametrize`) | **Yes** | Yes (via re-execution) | No | No | No (no import edge to follow) |
+| Coverage instrumentation required | **No** | Yes | No | No | No |
+| conftest.py / fixture changes | precise, per fixture (fixture graph) | precise (via coverage) | file-level only | not addressed | **whole-suite fallback** -- no import edge exists for injected fixtures, so `conftest.py` changes just run everything |
 
 [pytest-testmon]: https://pypi.org/project/pytest-testmon/
 [pytest-picked]: https://pypi.org/project/pytest-picked/
 [pytest-impacted]: https://pypi.org/project/pytest-impacted/
+[snob]: https://github.com/alexpasmantier/snob
 
 In short: **pytest-testmon** owns "did any source code this test actually
 executed change?" (via real coverage) -- the right tool for arbitrary
@@ -38,16 +40,44 @@ application-code changes. **pytest-picked** is file-level and fixture-blind:
 if you touch a shared `conftest.py`, it can only tell you *that file*
 changed, not *which tests* are actually affected by *which* fixture in it.
 **pytest-impacted** is diff/coverage oriented and doesn't reason about the
-fixture graph either. `pytest-impact` fills the specific gap of
-test-infrastructure churn -- shared fixtures, conftest hierarchies, collection
-hooks -- where a one-line change three `conftest.py` files up can silently
-invalidate a handful of specific tests, and file-level or coverage-based
-tools either over-select (whole file/whole subtree) or can't reason about it
-at all without first executing it once.
+fixture graph either. **snob** selects from the static *import* graph ("this
+changed file is transitively imported by these test files") and is fast and
+effective for source-level changes, but test modules never `import conftest`
+-- fixtures and hooks are injected by name at collection time, not imported
+-- so snob has no edge to follow there and falls back to running the entire
+suite on any `conftest.py`/config change. `pytest-impact` fills the specific
+gap of test-infrastructure churn -- shared fixtures, conftest hierarchies,
+collection hooks -- where a one-line change three `conftest.py` files up can
+silently invalidate a handful of specific tests, and file-level, import-graph,
+or coverage-based tools either over-select (whole file/whole subtree) or
+can't reason about it at all without first executing it once.
 
 Use `pytest-impact` and `pytest-testmon` together for the best of both: run
 `pytest-impact` to catch fixture/conftest/hook churn from a clean diff, and
 `pytest-testmon` for line-level coverage on everything else.
+
+### Composing with import-graph tools
+
+`pytest-impact` and import-graph selectors like `snob` cover different, mostly
+non-overlapping change axes -- app/source-code imports vs. the
+fixture/conftest graph -- so they compose well as a union rather than a
+choice. A simple CI recipe: run both selectors against the same diff and
+execute the union of their selected tests, e.g.
+
+```bash
+# snob: source/app-code import impact (prints selected test ids)
+snob $(git diff --name-only origin/main...HEAD) > snob_selected.txt
+
+# pytest-impact: fixture/conftest/hook impact
+pytest --impact --impact-base=origin/main --impact-explain-json=impact.json
+
+# union snob_selected.txt with the "selected" entries in impact.json, then run that set
+```
+
+To be clear about the boundary: `pytest-impact` deliberately does **not**
+track arbitrary application/source-code changes (see Limitations below) --
+that's exactly what `snob`'s import graph and `pytest-testmon`'s coverage
+tracing are for.
 
 ## Install
 
